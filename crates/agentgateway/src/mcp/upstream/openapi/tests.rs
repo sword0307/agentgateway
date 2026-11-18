@@ -1146,6 +1146,10 @@ fn test_parse_openapi_schema_maps_summary_to_tool_title() {
 		.find(|(tool, _)| tool.name == "getUsers")
 		.expect("tool should exist");
 	assert_eq!(without_summary.title, None);
+	assert!(
+		without_summary.output_schema.is_none(),
+		"a response without a JSON schema should not publish outputSchema"
+	);
 }
 
 #[rstest]
@@ -2176,6 +2180,205 @@ async fn test_openapi_from_url() {
 			panic!("Expected OpenAPI target spec, got {:?}", target.spec);
 		}
 	}
+}
+
+#[test]
+fn test_parse_openapi_schema_publishes_object_response_as_output_schema() {
+	let open_api: OpenAPI = serde_json::from_value(json!({
+		"openapi": "3.1.0",
+		"info": {"title": "语义资产", "version": "1.0"},
+		"paths": {
+			"/data_development/mcp_support/create_analysis_view": {
+				"post": {
+					"operationId": "createAssetAnalysisView",
+					"description": "创建分析视图",
+					"requestBody": {
+						"required": true,
+						"content": {
+							"application/json": {
+								"schema": {
+									"oneOf": [
+										{"type": "object"},
+										{"$ref": "#/components/schemas/CreateReq"}
+									]
+								}
+							}
+						}
+					},
+					"responses": {
+						"400": {
+							"description": "err",
+							"content": {
+								"application/json": {
+									"schema": {"$ref": "#/components/schemas/ErrorResp"}
+								}
+							}
+						},
+						"200": {
+							"description": "OK",
+							"content": {
+								"application/json": {
+									"schema": {"$ref": "#/components/schemas/CreateResp"}
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"components": {
+			"schemas": {
+				"CreateReq": {
+					"type": "object",
+					"properties": {"name": {"type": "string"}}
+				},
+				"CreateResp": {
+					"type": "object",
+					"properties": {
+						"id": {"type": "integer", "description": "新建分析视图 id"},
+						"common_resp": {"$ref": "#/components/schemas/CommonResp"}
+					}
+				},
+				"CommonResp": {
+					"type": "object",
+					"properties": {"code": {"type": "integer"}}
+				},
+				"ErrorResp": {
+					"type": "object",
+					"properties": {"message": {"type": "string"}}
+				}
+			}
+		}
+	}))
+	.expect("valid OpenAPI schema");
+	let tools = super::parse_openapi_schema(&open_api).expect("schema should parse");
+	let (tool, _) = tools
+		.iter()
+		.find(|(tool, _)| tool.name == "createAssetAnalysisView")
+		.expect("tool should exist");
+
+	let listed = serde_json::to_value(tool).expect("tool should serialize");
+	assert_eq!(
+		listed.get("outputSchema").cloned(),
+		Some(json!({
+			"type": "object",
+			"properties": {
+				"id": {"type": "integer", "description": "新建分析视图 id"},
+				"common_resp": {"$ref": "#/$defs/CommonResp"}
+			},
+			"$defs": {
+				"CommonResp": {
+					"type": "object",
+					"properties": {"code": {"type": "integer"}}
+				}
+			}
+		}))
+	);
+	assert!(
+		!listed["outputSchema"].to_string().contains("ErrorResp"),
+		"error responses must not become outputSchema"
+	);
+}
+
+#[test]
+fn test_parse_openapi_schema_wraps_non_object_response_schema() {
+	let open_api: OpenAPI = serde_json::from_value(json!({
+		"openapi": "3.0.0",
+		"info": {"title": "Lists", "version": "1.0.0"},
+		"paths": {
+			"/names": {
+				"get": {
+					"operationId": "listNames",
+					"responses": {
+						"201": {
+							"description": "created",
+							"content": {
+								"application/json": {
+									"schema": {
+										"type": "array",
+										"items": {"$ref": "#/components/schemas/Name"}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		},
+		"components": {
+			"schemas": {
+				"Name": {"type": "string"}
+			}
+		}
+	}))
+	.expect("valid OpenAPI schema");
+	let tools = super::parse_openapi_schema(&open_api).expect("schema should parse");
+	let (tool, _) = tools
+		.iter()
+		.find(|(tool, _)| tool.name == "listNames")
+		.expect("tool should exist");
+	assert_eq!(
+		serde_json::to_value(tool.output_schema.as_deref()).unwrap(),
+		json!({
+			"type": "object",
+			"properties": {
+				"data": {
+					"type": "array",
+					"items": {"$ref": "#/$defs/Name"}
+				}
+			},
+			"required": ["data"],
+			"$defs": {
+				"Name": {"type": "string"}
+			}
+		})
+	);
+}
+
+#[test]
+fn test_parse_openapi_schema_resolves_component_response() {
+	let open_api: OpenAPI = serde_json::from_value(json!({
+		"openapi": "3.0.0",
+		"info": {"title": "Reusable responses", "version": "1.0.0"},
+		"paths": {
+			"/items": {
+				"get": {
+					"operationId": "getItem",
+					"responses": {
+						"200": {"$ref": "#/components/responses/Item"}
+					}
+				}
+			}
+		},
+		"components": {
+			"responses": {
+				"Item": {
+					"description": "one item",
+					"content": {
+						"application/json; charset=utf-8": {
+							"schema": {
+								"type": "object",
+								"properties": {"id": {"type": "string"}}
+							}
+						}
+					}
+				}
+			}
+		}
+	}))
+	.expect("valid OpenAPI schema");
+	let tools = super::parse_openapi_schema(&open_api).expect("schema should parse");
+	let (tool, _) = tools
+		.iter()
+		.find(|(tool, _)| tool.name == "getItem")
+		.expect("tool should exist");
+	assert_eq!(
+		serde_json::to_value(tool.output_schema.as_deref()).unwrap(),
+		json!({
+			"type": "object",
+			"properties": {"id": {"type": "string"}}
+		})
+	);
 }
 
 #[test]

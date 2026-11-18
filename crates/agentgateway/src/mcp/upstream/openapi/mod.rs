@@ -11,7 +11,7 @@ use headers::HeaderMapExt;
 use http::Method;
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST, TRANSFER_ENCODING};
 use once_cell::sync::Lazy;
-use openapiv3::{OpenAPI, Parameter, ReferenceOr, RequestBody};
+use openapiv3::{OpenAPI, Parameter, ReferenceOr, RequestBody, StatusCode};
 use percent_encoding::{AsciiSet, utf8_percent_encode};
 use regex::Regex;
 use rmcp::model::{
@@ -243,6 +243,190 @@ fn parameter_merge_name(parameter: &Parameter) -> String {
 	}
 }
 
+/// Pick the success response whose JSON body should be described by `outputSchema`.
+///
+/// Explicit `200` wins, then `201`, then any other `2xx`, then a `2XX` range.
+/// A status without an `application/json` schema is skipped, so a description-only
+/// `200` does not hide a later success schema, and `4xx` schemas are never used.
+fn success_response_with_json_schema<'a>(
+	op: &'a openapiv3::Operation,
+	doc: &'a OpenAPI,
+) -> Result<Option<&'a openapiv3::Response>, ParseError> {
+	let mut ranked: Vec<(u16, StatusCode)> = op
+		.responses
+		.responses
+		.keys()
+		.filter_map(|code| success_status_rank(code).map(|rank| (rank, code.clone())))
+		.collect();
+	ranked.sort_by_key(|(rank, _)| *rank);
+
+	for (_, code) in ranked {
+		let Some(response_ref) = op.responses.responses.get(&code) else {
+			continue;
+		};
+		let response = resolve_response(response_ref, doc)?;
+		if json_response_schema(response).is_some() {
+			return Ok(Some(response));
+		}
+	}
+	Ok(None)
+}
+
+fn success_status_rank(code: &StatusCode) -> Option<u16> {
+	match code {
+		StatusCode::Code(200) => Some(0),
+		StatusCode::Code(201) => Some(1),
+		StatusCode::Code(code) if (200..300).contains(code) => Some(100 + code),
+		StatusCode::Range(2) => Some(400),
+		_ => None,
+	}
+}
+
+fn resolve_response<'a>(
+	reference: &'a ReferenceOr<openapiv3::Response>,
+	doc: &'a OpenAPI,
+) -> Result<&'a openapiv3::Response, ParseError> {
+	match reference {
+		ReferenceOr::Reference { reference } => {
+			let name = reference
+				.strip_prefix("#/components/responses/")
+				.ok_or_else(|| ParseError::UnsupportedReference(reference.clone()))?;
+			let components = doc
+				.components
+				.as_ref()
+				.ok_or(ParseError::MissingComponents)?;
+			let response = components
+				.responses
+				.get(name)
+				.ok_or_else(|| ParseError::MissingReference(name.to_string()))?;
+			resolve_response(response, doc)
+		},
+		ReferenceOr::Item(response) => Ok(response),
+	}
+}
+
+fn json_response_schema(response: &openapiv3::Response) -> Option<&ReferenceOr<openapiv3::Schema>> {
+	if let Some(media) = response.content.get("application/json") {
+		return media.schema.as_ref();
+	}
+	response.content.iter().find_map(|(media_type, media)| {
+		let base = media_type.split(';').next()?.trim();
+		if base.eq_ignore_ascii_case("application/json") {
+			media.schema.as_ref()
+		} else {
+			None
+		}
+	})
+}
+
+/// MCP requires `outputSchema` to be a JSON Schema whose root type is `object`.
+/// A root `#/components/schemas/` reference is replaced by that schema so the
+/// published schema itself carries `type: object`. Nested references stay in `$defs`.
+fn output_schema_for_operation(
+	op: &openapiv3::Operation,
+	doc: &OpenAPI,
+) -> Result<Option<JsonObject>, ParseError> {
+	let Some(response) = success_response_with_json_schema(op, doc)? else {
+		return Ok(None);
+	};
+	let Some(schema_ref) = json_response_schema(response) else {
+		return Ok(None);
+	};
+	let schema = serde_json::to_value(schema_ref).map_err(ParseError::SerdeError)?;
+	let mut schema = lift_root_schema_ref(schema, doc, &mut BTreeSet::new())?;
+	ensure_explicit_object_type(&mut schema);
+	if !schema_describes_json_object(&schema) {
+		// CallToolResult wraps non-object JSON as {"data": ...}. The schema must match.
+		schema = json!({
+			"type": "object",
+			"properties": {"data": schema},
+			"required": ["data"]
+		});
+	}
+	bundle_component_schema_refs(&mut schema, doc)?;
+	schema
+		.as_object()
+		.cloned()
+		.map(Some)
+		.ok_or_else(|| ParseError::UnsupportedReference("output schema is not an object".to_string()))
+}
+
+fn lift_root_schema_ref(
+	schema: Value,
+	doc: &OpenAPI,
+	seen: &mut BTreeSet<String>,
+) -> Result<Value, ParseError> {
+	let Some(reference) = root_component_schema_ref(&schema) else {
+		return Ok(schema);
+	};
+	if !seen.insert(reference.clone()) {
+		return Err(ParseError::UnsupportedReference(format!(
+			"cyclic schema reference {reference}"
+		)));
+	}
+	let name = reference
+		.strip_prefix(COMPONENT_SCHEMA_PREFIX)
+		.ok_or_else(|| ParseError::UnsupportedReference(reference.clone()))?;
+	let components = doc
+		.components
+		.as_ref()
+		.ok_or(ParseError::MissingComponents)?;
+	let target = components
+		.schemas
+		.get(name)
+		.ok_or_else(|| ParseError::MissingReference(name.to_string()))?;
+	let mut lifted = serde_json::to_value(target).map_err(ParseError::SerdeError)?;
+	if let Some(description) = schema.get("description").cloned()
+		&& let Some(object) = lifted.as_object_mut()
+	{
+		object
+			.entry("description".to_string())
+			.or_insert(description);
+	}
+	lift_root_schema_ref(lifted, doc, seen)
+}
+
+fn root_component_schema_ref(schema: &Value) -> Option<String> {
+	let object = schema.as_object()?;
+	let reference = object.get("$ref")?.as_str()?;
+	if !reference.starts_with(COMPONENT_SCHEMA_PREFIX) {
+		return None;
+	}
+	let has_other_keywords = object
+		.keys()
+		.any(|key| key != "$ref" && key != "description");
+	if has_other_keywords {
+		return None;
+	}
+	Some(reference.to_string())
+}
+
+fn ensure_explicit_object_type(schema: &mut Value) {
+	let Some(object) = schema.as_object_mut() else {
+		return;
+	};
+	if object.contains_key("type") {
+		return;
+	}
+	if object.contains_key("properties")
+		|| object.contains_key("additionalProperties")
+		|| object.contains_key("patternProperties")
+	{
+		object.insert("type".to_string(), Value::String("object".to_string()));
+	}
+}
+
+fn schema_describes_json_object(schema: &Value) -> bool {
+	let Some(object) = schema.as_object() else {
+		return false;
+	};
+	match object.get("type") {
+		Some(Value::String(kind)) => kind == "object",
+		Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some("object")),
+		_ => false,
+	}
+}
+
 /// We need to rework this and I don't want to forget.
 ///
 /// We need to be able to handle data which can end up in multiple destinations:
@@ -402,6 +586,9 @@ pub(crate) fn parse_openapi_schema(
 							if let Some(summary) = op.summary.as_ref().filter(|s| !s.is_empty()) {
 								let end = std::cmp::min(64, summary.len());
 								tool = tool.with_title(summary[..summary.floor_char_boundary(end)].to_string());
+							}
+							if let Some(output_schema) = output_schema_for_operation(op, open_api)? {
+								tool = tool.with_raw_output_schema(Arc::new(output_schema));
 							}
 							let upstream = UpstreamOpenAPICall {
 								// method: Method::from_bytes(method.as_ref()).expect("todo"),
