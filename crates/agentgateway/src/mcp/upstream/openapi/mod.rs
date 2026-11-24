@@ -15,7 +15,8 @@ use openapiv3::{OpenAPI, Parameter, ReferenceOr, RequestBody, StatusCode};
 use percent_encoding::{AsciiSet, utf8_percent_encode};
 use regex::Regex;
 use rmcp::model::{
-	CallToolResult, ClientRequest, ContentBlock, JsonObject, JsonRpcRequest, ResourceContents, Tool,
+	CallToolResult, ClientRequest, ContentBlock, JsonObject, JsonRpcRequest, ProtocolVersion,
+	ResourceContents, Tool,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -688,6 +689,22 @@ impl Default for JsonSchema {
 	}
 }
 
+/// Version named by an OpenAPI `initialize` response.
+///
+/// `outputSchema` is part of the tools specification in `2025-06-18` and `2025-11-25`.
+/// From `2026-07-28` the protocol has no initialize handshake, so a response that names
+/// that revision is rejected by clients that still open with initialize. Cursor's highest
+/// working revision is `2025-11-25`. Echo the client's handshake revision when it is one
+/// this server implements, and otherwise name `2025-11-25`.
+pub(crate) fn initialize_protocol_version(requested: &ProtocolVersion) -> ProtocolVersion {
+	let handshake = ProtocolVersion::known_up_to(&ProtocolVersion::LATEST_WITH_INITIALIZE);
+	if requested.has_initialize() && handshake.contains(requested) {
+		requested.clone()
+	} else {
+		ProtocolVersion::LATEST_WITH_INITIALIZE
+	}
+}
+
 /// Regex to match path template parameters like `{param_name}`.
 static PATH_PARAM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\{[^}]+\}").unwrap());
 
@@ -817,10 +834,14 @@ impl Handler {
 		let method = request.request.method();
 		let id = request.id;
 		let res = match request.request {
-			ClientRequest::InitializeRequest(_) => Messages::from_result(
-				id,
-				ServerConfig::new(ServerCapabilities::builder().enable_tools().build()),
-			),
+			ClientRequest::InitializeRequest(init) => {
+				let protocol_version = initialize_protocol_version(&init.params.protocol_version);
+				Messages::from_result(
+					id,
+					ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+						.with_protocol_version(protocol_version),
+				)
+			},
 			ClientRequest::GetPromptRequest(_) => Messages::from_result(id, GetPromptResult::new(vec![])),
 			ClientRequest::ListPromptsRequest(_) => Messages::from_result(
 				id,

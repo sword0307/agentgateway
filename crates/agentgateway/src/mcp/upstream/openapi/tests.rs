@@ -204,6 +204,104 @@ async fn setup() -> (MockServer, Handler) {
 	setup_with_prefix("").await
 }
 
+#[test]
+fn initialize_protocol_version_stays_on_the_handshake_revision() {
+	use rmcp::model::ProtocolVersion;
+
+	assert_eq!(
+		super::initialize_protocol_version(&ProtocolVersion::V_2025_11_25),
+		ProtocolVersion::V_2025_11_25
+	);
+	assert_eq!(
+		super::initialize_protocol_version(&ProtocolVersion::V_2025_06_18),
+		ProtocolVersion::V_2025_06_18
+	);
+	assert_eq!(
+		super::initialize_protocol_version(&ProtocolVersion::V_2024_11_05),
+		ProtocolVersion::V_2024_11_05
+	);
+	assert_eq!(
+		super::initialize_protocol_version(&ProtocolVersion::V_2026_07_28),
+		ProtocolVersion::V_2025_11_25
+	);
+}
+
+#[tokio::test]
+async fn initialize_answers_cursor_with_2025_11_25_and_lists_output_schema() {
+	use futures_util::StreamExt;
+	use rmcp::model::*;
+
+	let open_api: OpenAPI = serde_json::from_value(json!({
+		"openapi": "3.0.0",
+		"info": {"title": "Views", "version": "1.0.0"},
+		"paths": {
+			"/views": {
+				"post": {
+					"operationId": "createView",
+					"responses": {
+						"200": {
+							"description": "created",
+							"content": {
+								"application/json": {
+									"schema": {
+										"type": "object",
+										"properties": {"id": {"type": "integer"}}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}))
+	.expect("valid OpenAPI schema");
+	let (_, mut handler) = setup().await;
+	handler.tools = super::parse_openapi_schema(&open_api).expect("schema should parse");
+
+	for requested in [ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28] {
+		let params = InitializeRequestParams::new(
+			ClientCapabilities::default(),
+			Implementation::new("cursor", "3.31.15"),
+		)
+		.with_protocol_version(requested);
+		let request = JsonRpcRequest::new(
+			RequestId::Number(1),
+			ClientRequest::from(InitializeRequest::new(params)),
+		);
+		let mut stream = handler
+			.send_message(request, &IncomingRequestContext::empty())
+			.await
+			.expect("initialize should succeed");
+		let message = stream.next().await.expect("initialize response").unwrap();
+		let value = serde_json::to_value(message).unwrap();
+		assert_eq!(
+			value["result"]["protocolVersion"], "2025-11-25",
+			"initialize must name the handshake revision Cursor can accept"
+		);
+	}
+
+	let list = JsonRpcRequest::new(
+		RequestId::Number(2),
+		ClientRequest::from(ListToolsRequest::with_param(
+			PaginatedRequestParams::default(),
+		)),
+	);
+	let mut stream = handler
+		.send_message(list, &IncomingRequestContext::empty())
+		.await
+		.expect("tools/list should succeed");
+	let message = stream.next().await.expect("tools/list response").unwrap();
+	let value = serde_json::to_value(message).unwrap();
+	assert_eq!(
+		value["result"]["tools"][0]["outputSchema"],
+		json!({
+			"type": "object",
+			"properties": {"id": {"type": "integer"}}
+		})
+	);
+}
+
 #[tokio::test]
 async fn listen_emits_empty_ack_and_keeps_the_stream_open() {
 	use futures_util::StreamExt;
